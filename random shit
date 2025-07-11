@@ -1,0 +1,354 @@
+import networkx as nx
+import React, { useState } from "react";
+import axios from "axios";
+import DatePicker from "react-datepicker";
+from flask import Flask, request, jsonify
+from amadeus import Client, ResponseError
+import sqlite3, json, time
+import "react-datepicker/dist/react-datepicker.css";
+
+/// multi-city/leg routing , cheapest date search (date flexibility), filtering options (airlines, direct, cabin class), caching flight results, price monitoring, notification on price changes
+/// , UI Calendar with React, background worker and notification integration with Flask/Celery
+
+
+[User Interface]
+     ↓ (select dates/cities)
+Backend:
+  1. get_best_dates()
+     ↓
+  2. flight_offers_search()
+     ↓ cache_offer()
+     ↓ present options to user
+     ↓ user selects offer
+  3. pricing API call
+     ↓ display final price
+     ↓ user confirms
+  4. flight_orders.create()
+     ↓ get booking PNR
+
+Background Scheduler:
+  - check_price_drops()
+  - notify_drop()
+
+
+def find_cheapest_flight(flights, origin, destination):
+    """
+    flights: list of tuples (origin, destination, cost)
+    origin: starting country/city
+    destination: target country/city
+    """
+    G = nx.DiGraph()
+
+    # Build graph from flight data
+    for src, dst, cost in flights:
+        G.add_edge(src, dst, weight=cost)
+
+    try:
+        # Dijkstra to find cheapest path
+        cost = nx.dijkstra_path_length(G, origin, destination, weight='weight')
+        path = nx.dijkstra_path(G, origin, destination, weight='weight')
+        return path, cost
+    except nx.NetworkXNoPath:
+        return None, float('inf')
+
+
+# Example flight data (origin, destination, cost)
+flights = [
+    ("USA", "UK", 500),
+    ("UK", "Germany", 150),
+    ("USA", "Germany", 800),
+    ("Germany", "India", 400),
+    ("UK", "India", 600),
+    ("India", "Australia", 700),
+    ("Germany", "Australia", 900)
+]
+
+# Usage example
+origin = "USA"
+destination = "Australia"
+
+path, total_cost = find_cheapest_flight(flights, origin, destination)
+
+if path:
+    print(f"Cheapest path: {' -> '.join(path)}")
+    print(f"Total cost: ${total_cost}")
+else:
+    print("No available flight path.")
+
+from amadeus import Client, ResponseError
+
+# Initialize client (replace with your credentials)
+amadeus = Client(
+    client_id='YOUR_AMADEUS_API_KEY',
+    client_secret='YOUR_AMADEUS_API_SECRET'
+)
+
+def find_cheapest_flights(origin, destination, date):
+    try:
+        response = amadeus.shopping.flight_offers_search.get(
+            originLocationCode=origin,
+            destinationLocationCode=destination,
+            departureDate=date,
+            adults=1,
+            max=5
+        )
+        offers = response.data
+        # Sort by total price
+        offers.sort(key=lambda x: float(x['price']['total']))
+        return offers
+    except ResponseError as err:
+        print("API error:", err)
+        return []
+
+def display_offer(offer):
+    price = offer['price']['total']
+    segments = offer['itineraries'][0]['segments']
+    route = " → ".join(f"{s['departure']['iataCode']}-{s['arrival']['iataCode']}" for s in segments)
+    return f"Route: {route} | Price: {price}"
+
+if __name__ == "__main__":
+    origin = "WAW"     # Warsaw
+    dest = "JFK"       # New York
+    date = "2025-08-15"
+    offers = find_cheapest_flights(origin, dest, date)
+    if not offers:
+        print("No flights found.")
+    else:
+        cheapest = offers[0]
+        print("Cheapest found:")
+        print(display_offer(cheapest))
+        print("\nOther affordable options:")
+        for o in offers[1:]:
+            print(display_offer(o))
+
+import json
+from amadeus import Client, ResponseError
+
+amadeus = Client(client_id='YOUR_API_KEY', client_secret='YOUR_API_SECRET')
+
+def find_multicity(legs, adults=1, max_offers=5, cabin='ECONOMY', direct_only=False):
+    od = []
+    for i, (orig, dest, date) in enumerate(legs, start=1):
+        od.append({
+            "id": str(i),
+            "originLocationCode": orig,
+            "destinationLocationCode": dest,
+            "departureDateTimeRange": {"date": date, "time": "00:00:00"}
+        })
+    body = {
+        "currencyCode": "EUR",
+        "originDestinations": od,
+        "travelers": [{"id": "1", "travelerType": "ADULT"} for _ in range(adults)],
+        "sources": ["GDS"],
+        "searchCriteria": {
+            "maxFlightOffers": max_offers,
+            "flightFilters": {
+                "connectionRestriction": {"stopQuantity": 0} if direct_only else {"stopQuantity": 10},
+                "cabinRestrictions": [{
+                    "cabin": cabin,
+                    "coverage": "MOST_SEGMENTS",
+                    "originDestinationIds": [leg["id"] for leg in od]
+                }]
+            }
+        }
+    }
+    try:
+        resp = amadeus.shopping.flight_offers_search.post(body)
+        return resp.data
+    except ResponseError as err:
+        print("API error:", err)
+        return []
+
+legs = [
+    ("WAW", "LON", "2025-08-01"),
+    ("LON", "PAR", "2025-08-05"),
+    ("PAR", "WAW", "2025-08-10")
+]
+offers = find_multicity(legs, adults=2, direct_only=True)
+print(f"Found {len(offers)} offers.")
+
+if __name__ == "__main__":
+    # Step 1: find cheapest outbound + return dates
+    cd = cheapest_dates("WAW", "JFK")
+    best = sorted(cd, key=lambda x: float(x["price"]))[0]
+    out, ret = best["departureDate"], best.get("returnDate")
+
+    # Step 2: search for round‑trip
+    if ret:
+        offers = amadeus.shopping.flight_offers_search.get(
+            originLocationCode="WAW", destinationLocationCode="JFK",
+            departureDate=out, returnDate=ret, adults=1, max=5,
+            includedAirlineCodes="LO", travelClass="ECONOMY"
+        ).data
+    else:
+        offers = []
+
+    # Step 3: pick cheapest
+    if offers:
+        cheapest = sorted(offers, key=lambda x: float(x["price"]["total"]))[0]
+        segments = cheapest["itineraries"][0]["segments"]
+        route = " → ".join(s["departure"]["iataCode"] + "-" + s["arrival"]["iataCode"] for s in segments)
+        print(f"Route: {route}\nTotal price: €{cheapest['price']['total']}")
+    else:
+        print("No suitable offers found.")
+
+import sqlite3, time
+from amadeus import Client
+
+amadeus = Client(client_id=…, client_secret=…)
+
+def init_db():
+    c = sqlite3.connect('flights.db').cursor()
+    c.execute('''
+      CREATE TABLE IF NOT EXISTS offers (
+        id TEXT PRIMARY KEY, offer_json TEXT, last_checked REAL
+      )
+    ''')
+    c.connection.commit()
+
+def cache_offer(offer):
+    conn = sqlite3.connect('flights.db')
+    conn.execute('INSERT OR REPLACE INTO offers VALUES (?, ?, ?)',
+                 (offer['id'], json.dumps(offer), time.time()))
+    conn.commit()
+
+def check_price_drops(threshold=0.05):
+    conn = sqlite3.connect('flights.db')
+    for row in conn.execute('SELECT id, offer_json FROM offers'):
+        offer = json.loads(row[1])
+        priced = amadeus.shopping.flight_offers.pricing.post(offer).data
+        new_price = float(priced['price']['total'])
+        old_price = float(offer['price']['total'])
+        if new_price < old_price * (1 - threshold):
+            # trigger notification
+            print(f"Price drop {old_price} → {new_price} for offer {offer['id']}")
+            cache_offer(priced)
+
+from telegram import Bot
+bot = Bot(token='YOUR_TELEGRAM_TOKEN')
+def notify_drop(chat_id, message):
+    bot.send_message(chat_id=chat_id, text=message)
+
+def get_best_dates(origin, dest):
+    data = amadeus.shopping.flight_dates.get(origin=origin, destination=dest).data
+    return sorted(data, key=lambda x: float(x['price']))[0]
+
+# Steps 1–3 consolidated
+offers = amadeus.shopping.flight_offers_search.get(...).data
+best = offers[0]
+priced = amadeus.shopping.flight_offers.pricing.post(best).data
+order = amadeus.booking.flight_orders.post(priced, traveler_info).data
+print("Booked! PNR:", order['id'])
+
+upsell = amadeus.shopping.flight_offers.upselling.post({
+    "data": {"flightOffers": [best], "payments": […]}
+}).data
+
+function App() {
+  const [origin, setOrigin] = useState("WAW");
+  const [destination, setDestination] = useState("JFK");
+  const [departureDate, setDepartureDate] = useState(new Date());
+  const [returnDate, setReturnDate] = useState(null);
+  const [offers, setOffers] = useState([]);
+
+  const searchFlights = async () => {
+    const resp = await axios.post("/api/search", {
+      origin, destination,
+      departureDate: departureDate.toISOString().split("T")[0],
+      returnDate: returnDate?.toISOString().split("T")[0],
+      directOnly: true
+    });
+    setOffers(resp.data);
+  };
+
+  return (
+    <div>
+      <h2>Flight Search</h2>
+      <input value={origin} onChange={e => setOrigin(e.target.value.toUpperCase())} placeholder="Origin IATA" />
+      <input value={destination} onChange={e => setDestination(e.target.value.toUpperCase())} placeholder="Destination IATA" />
+      <DatePicker selected={departureDate} onChange={setDepartureDate} />
+      <DatePicker selected={returnDate} onChange={setReturnDate} placeholderText="Return (optional)" />
+      <button onClick={searchFlights}>Search</button>
+      <ul>
+        {offers.map(o => (
+          <li key={o.id}>
+            {o.route} | €{o.price}
+            <button onClick={()=>axios.post("/api/select", {offerId: o.id})}>Select & Book</button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+app = Flask(__name__)
+amadeus = Client(client_id="...", client_secret="...")
+
+def init_db():
+    conn = sqlite3.connect("app.db")
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS offers (
+          id TEXT PRIMARY KEY,
+          offer_json TEXT,
+          last_checked REAL
+        );
+    ''')
+    conn.commit()
+    conn.close()
+
+@app.route("/api/search", methods=["POST"])
+def search():
+    data = request.json
+    origin, dest = data["origin"], data["destination"]
+    dep, ret = data["departureDate"], data.get("returnDate")
+    body = {
+      "originDestinations": [{
+        "id": "1",
+        "originLocationCode": origin,
+        "destinationLocationCode": dest,
+        "departureDateTimeRange": {"date": dep, "time": "00:00:00"}
+      }],
+      "travelers":[{"id":"1","travelerType":"ADULT"}],
+      "sources":["GDS"],
+      "searchCriteria": {
+        "flightFilters": {"stopQuantity": 0 if data.get("directOnly") else {"stopQuantity":10}},
+        "cabinRestrictions": [{"cabin":"ECONOMY","coverage":"MOST_SEGMENTS","originDestinationIds":["1"]}]
+      }
+    }
+    if ret:
+      body["originDestinations"].append({
+        "id": "2", "originLocationCode": dest,
+        "destinationLocationCode": origin,
+        "departureDateTimeRange": {"date": ret, "time":"00:00:00"}
+      })
+    resp = amadeus.shopping.flight_offers_search.post(body).data
+    offers = []
+    for o in resp:
+      priced = amadeus.shopping.flight_offers.pricing.post(o)
+      total = float(priced.data["price"]["total"])
+      route = " -> ".join(s["departure"]["iataCode"] + "-" + s["arrival"]["iataCode"]
+                         for seg in priced.data["itineraries"] for s in seg["segments"])
+      offers.append({"id": o["id"], "price": total, "route": route, "raw": priced.data})
+      conn = sqlite3.connect("app.db")
+      conn.execute("INSERT OR REPLACE INTO offers VALUES (?, ?, ?)",
+                  (o["id"], json.dumps(priced.data), time.time()))
+      conn.commit()
+      conn.close()
+    return jsonify(offers)
+
+@app.route("/api/select", methods=["POST"])
+def select():
+    offerId = request.json["offerId"]
+    conn = sqlite3.connect("app.db")
+    row = conn.execute("SELECT offer_json FROM offers WHERE id=?", (offerId,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error":"Offer not found"}), 404
+    priced = json.loads(row[0])
+    order = amadeus.booking.flight_orders.post(priced, {"traveler":[]}).data
+    return jsonify({"pnr": order["id"]})
+
+@app.route("/api/select", methods=["POST"])
+def select():
+    offerId = request.json["offerId"]  
+    conn = sqlite3.connect("add.db")    
